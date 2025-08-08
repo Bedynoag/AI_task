@@ -17,6 +17,7 @@ from langchain_core.output_parsers import JsonOutputParser
 from dotenv import load_dotenv
 import os
 import json
+import uuid
 
 # Load environment variables
 load_dotenv()
@@ -98,25 +99,26 @@ class ForecastingChatbot:
             input_variables=["query", "prev_query", "categories", "stores"],
             template="""
             You are a retail forecasting assistant. Parse the user's query to extract:
-            - Category (one of: {categories}, or simplified as HOBBIES, HOUSEHOLD, FOODS)
+            - Category (one of: {categories}, or simplified as HOBBIES, HOUSEHOLD, FOODS, or specific sub-categories like HOBBIES_1, FOODS_1)
             - Item number (three-digit number, e.g., '001', default '001' if not specified)
             - Store(s) (one or more of: {stores}, or state codes CA, TX, WI for all stores in that state, or 'all stores')
             - Date range (format 'YYYY-MM-DD to YYYY-MM-DD' or 'DD-MM-YYYY to DD-MM-YYYY', or None if not specified)
             
-            Map simplified categories to data categories:
+            Map simplified categories to data categories only if no specific sub-category is provided:
             - HOBBIES -> HOBBIES_1 or HOBBIES_2 (default to HOBBIES_1 if item starts with '1', else HOBBIES_2)
             - HOUSEHOLD -> HOUSEHOLD_1 or HOUSEHOLD_2 (default to HOUSEHOLD_1 if item starts with '1', else HOUSEHOLD_2)
             - FOODS -> FOODS_1, FOODS_2, or FOODS_3 (default to FOODS_3 for items like '001')
             
+            If the query specifies a sub-category (e.g., FOODS_1_001 or FOODS_1), preserve it as the category unless invalid.
             If the query references a previous query (e.g., "instead of CA_2 show TX_1" or "add TX_1 and remove CA_2"):
             - Use the previous query to fill in missing fields (category, item, date range).
             - For stores, start with the previous query's stores if available.
-            - If 'add' is in the query, include new stores in the store list.
-            - If 'remove' is in the query, exclude specified stores from the store list.
+            - If 'add' or synonym of 'add' word is in the query, include new stores in the store list.
+            - If 'remove' or synonym of 'remove' word is in the query, exclude specified stores from the store list.
             
             For long or complex queries, focus on extracting only the relevant components (category, item, stores, date range) and ignore extraneous details unrelated to forecasting. For example:
-            - Query: "Show me the forecast for FOODS item 001 in California stores, but exclude CA_2, include TX_1, and focus on the period from May 23, 2016, to June 19, 2016, with insights on sales trends"
-              - Category: FOODS
+            - Query: "Show me the forecast for FOODS_1 item 001 in California stores, but exclude CA_2, include TX_1, and focus on the period from May 23, 2016, to June 19, 2016, with insights on sales trends"
+              - Category: FOODS_1
               - Item: 001
               - Stores: CA_1, CA_3, CA_4, TX_1
               - Date range: 2016-05-23 to 2016-06-19
@@ -150,7 +152,7 @@ class ForecastingChatbot:
             response = chain.invoke({
                 "query": query,
                 "prev_query": json.dumps(prev_query) if prev_query else "None",
-                "categories": ", ".join(['HOBBIES', 'HOUSEHOLD', 'FOODS']),
+                "categories": ", ".join(['HOBBIES', 'HOUSEHOLD', 'FOODS', 'HOBBIES_1', 'HOBBIES_2', 'HOUSEHOLD_1', 'HOUSEHOLD_2', 'FOODS_1', 'FOODS_2', 'FOODS_3']),
                 "stores": ", ".join(all_stores)
             })
             
@@ -169,23 +171,25 @@ class ForecastingChatbot:
                 if not parsed.get('stores') and prev_query.get('stores'):
                     parsed['stores'] = prev_query['stores']
             
-            # Map simplified category to data category
+            # Map simplified category to data category only if no specific sub-category is provided
             item = parsed.get('item', '001')
             if parsed.get('category'):
                 category_input = parsed['category'].upper()
-                if category_input == 'HOBBIES':
+                if category_input in data_categories:
+                    parsed['category'] = category_input  # Preserve if already a valid sub-category
+                elif category_input == 'HOBBIES':
                     parsed['category'] = 'HOBBIES_1' if item.startswith('1') else 'HOBBIES_2'
                 elif category_input == 'HOUSEHOLD':
                     parsed['category'] = 'HOUSEHOLD_1' if item.startswith('1') else 'HOUSEHOLD_2'
                 elif category_input == 'FOODS':
                     parsed['category'] = 'FOODS_3'  # Default to FOODS_3 for FOODS_001
                 elif parsed['category'] not in data_categories:
-                    parsed['error'] = f"Invalid category: {parsed['category']}. Must be one of: HOBBIES, HOUSEHOLD, FOODS"
+                    parsed['error'] = f"Invalid category: {parsed['category']}. Must be one of: HOBBIES, HOUSEHOLD, FOODS, or sub-categories like HOBBIES_1, FOODS_1"
                     return parsed
             
             # Validate category
             if not parsed.get('category') or parsed['category'] not in data_categories:
-                parsed['error'] = f"Invalid or missing category. Must be one of: HOBBIES, HOUSEHOLD, FOODS"
+                parsed['error'] = f"Invalid or missing category. Must be one of: HOBBIES, HOUSEHOLD, FOODS, or sub-categories like HOBBIES_1, FOODS_1"
                 return parsed
             
             # Handle stores with add/remove logic
@@ -436,77 +440,96 @@ class ForecastingChatbot:
             st.error(f"Error creating chart: {str(e)}")
             return None
     
-    def generate_insights(self, data: pd.DataFrame, category: str, item: str, store: str) -> str:
-        """Generate insights from forecast data"""
+    def generate_insights(self, data_dict: Dict[str, pd.DataFrame], category: str, item: str, stores: List[str]) -> str:
+        """Generate per-store insights from forecast data"""
         try:
-            date_columns = [col for col in data.columns if re.match(r'^\d+$', col)]
-            if not date_columns:
-                return "No forecast data available for insights."
-            
-            values = [float(data[d].iloc[0]) for d in date_columns if pd.notna(data[d].iloc[0])]
-            if not values:
-                return "No valid sales data available for insights."
-            
-            avg_sales = np.mean(values)
-            max_sales = np.max(values)
-            min_sales = np.min(values)
-            total_sales = np.sum(values)
-            
-            # Map day columns to dates
+            insights = []
             date_map = {}
             if self.data_loader.calendar_data is not None:
                 for _, row in self.data_loader.calendar_data.iterrows():
                     if pd.notna(row['d']) and pd.notna(row['date']):
                         date_map[str(row['d'])] = row['date']
             
-            # Event impact
-            event_insight = ""
-            if self.data_loader.calendar_data is not None:
-                event_days = self.data_loader.calendar_data[
-                    self.data_loader.calendar_data['event_name_1'].notna() |
-                    self.data_loader.calendar_data['event_name_2'].notna()
-                ]
-                event_sales = []
-                for _, row in event_days.iterrows():
-                    d = str(row['d'])
-                    if d in date_columns and pd.notna(data[d].iloc[0]):
-                        event_sales.append(float(data[d].iloc[0]))
-                if event_sales:
-                    avg_event_sales = np.mean(event_sales)
-                    event_insight = f"\n• **Event Impact**: Average sales on event days: {avg_event_sales:.1f} units (vs. {avg_sales:.1f} overall)."
+            for store in stores:
+                if store not in data_dict:
+                    insights.append(f"**{store}**: No forecast data available.")
+                    continue
+                
+                data = data_dict[store]
+                date_columns = [col for col in data.columns if re.match(r'^\d+$', col)]
+                if not date_columns:
+                    insights.append(f"**{store}**: No forecast data available for the specified period.")
+                    continue
+                
+                # Collect sales data for this store
+                values = []
+                for d in date_columns:
+                    if pd.notna(data[d].iloc[0]):
+                        values.append(float(data[d].iloc[0]))
+                
+                if not values:
+                    insights.append(f"**{store}**: No valid sales data available.")
+                    continue
+                
+                # Calculate metrics
+                avg_sales = np.mean(values)
+                max_sales = np.max(values)
+                min_sales = np.min(values)
+                total_sales = np.sum(values)
+                trend_slope = np.polyfit(range(len(values)), sorted(values), 1)[0] if len(values) > 1 else 0
+                trend_direction = "increasing" if trend_slope > 0 else "decreasing" if trend_slope < 0 else "stable"
+                
+                # Event impact for this store
+                event_insight = ""
+                if self.data_loader.calendar_data is not None:
+                    event_days = self.data_loader.calendar_data[
+                        self.data_loader.calendar_data['event_name_1'].notna() |
+                        self.data_loader.calendar_data['event_name_2'].notna()
+                    ]
+                    event_sales = []
+                    for _, row in event_days.iterrows():
+                        d = str(row['d'])
+                        if d in date_columns and pd.notna(data[d].iloc[0]):
+                            event_sales.append(float(data[d].iloc[0]))
+                    if event_sales:
+                        avg_event_sales = np.mean(event_sales)
+                        event_insight = f"\n• **Event Impact**: Average sales on event days: {avg_event_sales:.1f} units (vs. {avg_sales:.1f} overall)."
+                
+                # SNAP impact for this store
+                snap_insight = ""
+                state = store.split('_')[0]
+                snap_col = f'snap_{state}'
+                if self.data_loader.calendar_data is not None and snap_col in self.data_loader.calendar_data.columns:
+                    snap_dates = self.data_loader.calendar_data[
+                        self.data_loader.calendar_data[snap_col] == 1
+                    ]['d'].astype(str).tolist()
+                    snap_sales = []
+                    for d in date_columns:
+                        if d in snap_dates and pd.notna(data[d].iloc[0]):
+                            snap_sales.append(float(data[d].iloc[0]))
+                    if snap_sales:
+                        avg_snap_sales = np.mean(snap_sales)
+                        snap_insight = f"\n• **SNAP Impact ({state})**: Average sales on SNAP days: {avg_snap_sales:.1f} units (vs. {avg_sales:.1f} overall)."
+                
+                # Format insights for this store
+                store_insights = f"""
+                **{store} Insights for {category}_{item}:**
+                • **Average Daily Sales**: {avg_sales:.1f} units
+                • **Peak Sales**: {max_sales:.0f} units
+                • **Minimum Sales**: {min_sales:.0f} units
+                • **Total Forecast**: {total_sales:.0f} units over {len(date_columns)} days
+                • **Trend**: Sales are {trend_direction} (slope: {trend_slope:.3f})
+                {event_insight}
+                {snap_insight}
+                • **Sales Volatility**: {np.std(values):.2f}
+                • **Non-zero Sales Days**: {len([v for v in values if v > 0])}/{len(date_columns)} days
+                """
+                insights.append(store_insights)
             
-            # SNAP impact by state
-            snap_insight = ""
-            state = store.split('_')[0]
-            snap_col = f'snap_{state}'
-            if self.data_loader.calendar_data is not None and snap_col in self.data_loader.calendar_data.columns:
-                snap_dates = self.data_loader.calendar_data[
-                    self.data_loader.calendar_data[snap_col] == 1
-                ]['d'].astype(str).tolist()
-                snap_sales = [float(data[d].iloc[0]) for d in date_columns if d in snap_dates and pd.notna(data[d].iloc[0])]
-                if snap_sales:
-                    avg_snap_sales = np.mean(snap_sales)
-                    snap_insight = f"\n• **SNAP Impact ({state})**: Average sales on SNAP days: {avg_snap_sales:.1f} units (vs. {avg_sales:.1f} overall)."
+            if not insights:
+                return "No forecast data available for insights."
             
-            trend_slope = np.polyfit(range(len(values)), values, 1)[0] if len(values) > 1 else 0
-            trend_direction = "increasing" if trend_slope > 0 else "decreasing" if trend_slope < 0 else "stable"
-            
-            insights = f"""
-            📊 **Forecast Insights for {category}_{item} in {store}:**
-            
-            • **Average Daily Sales**: {avg_sales:.1f} units
-            • **Peak Sales**: {max_sales:.0f} units
-            • **Minimum Sales**: {min_sales:.0f} units
-            • **Total Forecast**: {total_sales:.0f} units over {len(date_columns)} days
-            • **Trend**: Sales are {trend_direction} (slope: {trend_slope:.3f})
-            {event_insight}
-            {snap_insight}
-            
-            💡 **Key Observations:**
-            • Sales volatility: {np.std(values):.2f}
-            • Non-zero sales days: {len([v for v in values if v > 0])}/{len(date_columns)} days
-            """
-            return insights
+            return "\n\n".join(insights)
         except Exception as e:
             return f"Error generating insights: {str(e)}"
 
@@ -538,13 +561,13 @@ def main():
         st.header("📝 Example Queries")
         st.markdown("""
         Try asking questions like:
-        • "Show forecasting of FOODS_001 in CA from 2016-05-23 to 2016-06-19"
+        • "Show forecasting of FOODS_1_001 in CA from 2016-05-23 to 2016-06-19"
         • "Show forecasting of FOODS_001 in CA from 23-05-2016 to 19-06-2016"
         • "Forecast for HOBBIES_002 in all stores"
         • "Household products forecast for TX_1"
-        • "Instead of CA_2, show TX_1 for FOODS_001"
+        • "Instead of CA_2, show TX_1 for FOODS_1_001"
         • "Add TX_1 and remove CA_2"
-        • "Show me the forecast for FOODS item 001 in California stores, but exclude CA_2, include TX_1, and focus on the period from May 23, 2016, to June 19, 2016, with insights on sales trends"
+        • "Show me the forecast for FOODS_1 item 001 in California stores, but exclude CA_2, include TX_1, and focus on the period from May 23, 2016, to June 19, 2016, with insights on sales trends"
         """)
         
         st.header("🏪 Available Options")
@@ -580,7 +603,7 @@ def main():
         
         user_query = st.text_input(
             "Ask about forecasting:",
-            placeholder="e.g., Show forecasting of FOODS_001 in CA from 2016-05-23 to 2016-06-19",
+            placeholder="e.g., Show forecasting of FOODS_1_001 in CA from 2016-05-23 to 2016-06-19",
             key="user_input"
         )
         
@@ -635,11 +658,13 @@ def main():
                             data_dict, parsed_query['category'], parsed_query['item'], parsed_query['stores'], date_range
                         )
                         insights = st.session_state.chatbot.generate_insights(
-                            next(iter(data_dict.values())), parsed_query['category'], parsed_query['item'], parsed_query['stores'][0]
+                            data_dict, parsed_query['category'], parsed_query['item'], parsed_query['stores']
                         )
                         st.session_state.chat_history.append(("bot", insights))
                         if chart:
-                            st.session_state.chat_history.append(("chart", chart, f"chart_{parsed_query['category']}_{parsed_query['item']}_{'_'.join(parsed_query['stores'])}_{date_range[0].strftime('%Y%m%d') if date_range else 'all'}"))
+                            # Generate a unique key using UUID
+                            unique_key = f"chart_{parsed_query['category']}_{parsed_query['item']}_{'_'.join(sorted(parsed_query['stores']))}_{date_range[0].strftime('%Y%m%d') if date_range else 'all'}_{uuid.uuid4()}"
+                            st.session_state.chat_history.append(("chart", chart, unique_key))
                     else:
                         st.session_state.chat_history.append((
                             "bot",
