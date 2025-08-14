@@ -47,6 +47,7 @@ def run_vrp_from_forecast(parsed_query, forecast_data_dict, vehicle_capacity=150
     Runs VRP using forecast totals as demands, optimizing for time and distance in real scenario.
     parsed_query: dict from chatbot.parse_query() → must contain 'stores'
     forecast_data_dict: dict {store_code: DataFrame} from get_forecast_data()
+    Returns: (map, route_order, total_distance, total_time, total_cost, lead_times)
     """
     stores_selected = parsed_query["stores"]
 
@@ -104,13 +105,13 @@ def run_vrp_from_forecast(parsed_query, forecast_data_dict, vehicle_capacity=150
         return all_demands[manager.IndexToNode(from_index)]
     demand_callback_index = routing.RegisterUnaryTransitCallback(demand_callback)
 
-    routing.AddDimensionWithVehicleCapacity(
-        demand_callback_index,
-        0,
-        [vehicle_capacity],
-        True,
-        'Capacity'
-    )
+    # routing.AddDimensionWithVehicleCapacity(
+    #     demand_callback_index,
+    #     0,
+    #     [vehicle_capacity],
+    #     True,
+    #     'Capacity'
+    # )
 
     # Skip zero-demand stores
     for i in range(len(all_locations)):
@@ -133,14 +134,22 @@ def run_vrp_from_forecast(parsed_query, forecast_data_dict, vehicle_capacity=150
     route_order = []
     total_distance = 0.0
     total_time = 0.0  # In seconds
+    lead_times = {}  # Store cumulative lead times in hours
+    cumulative_time = 0.0  # Track cumulative time along the route
+
     while not routing.IsEnd(index):
         node = manager.IndexToNode(index)
         route_order.append(node)
+        if node != DEPOT_INDEX:  # Store lead time for non-depot nodes
+            store_code = stores_selected[node - 1]  # node - 1 because depot is at index 0
+            lead_times[store_code] = cumulative_time / 3600.0  # Convert seconds to hours
         next_index = solution.Value(routing.NextVar(index))
         if next_index != routing.End(0):
             next_node = manager.IndexToNode(next_index)
             total_distance += distance_matrix[node][next_node]
-            total_time += duration_matrix[node][next_node]
+            leg_time = duration_matrix[node][next_node]
+            total_time += leg_time
+            cumulative_time += leg_time
         index = next_index
 
     # Calculate cost (real scenario: fuel + driver time)
@@ -169,7 +178,7 @@ def run_vrp_from_forecast(parsed_query, forecast_data_dict, vehicle_capacity=150
         folium.Marker(
             location=[loc["coords"][1], loc["coords"][0]],
             popup=f"📦 Stop #{stop_counter}<br>{loc['name']}<br>Demand: {demand}",
-            tooltip=f"Stop #{stop_counter}",
+            tooltip=f"{stores_selected[node-1]} (Stop #{stop_counter})",
             icon=folium.DivIcon(html=f'<div style="background-color: #4CAF50; color: white; border-radius: 50%; width: 30px; height: 30px; text-align: center; line-height: 30px; font-weight: bold;">{stop_counter}</div>')
         ).add_to(m)
         route_names.append(loc['name'])
@@ -189,4 +198,5 @@ def run_vrp_from_forecast(parsed_query, forecast_data_dict, vehicle_capacity=150
         icon=folium.Icon(color='blue', icon='info-sign')
     ).add_to(m)
 
-    return m, route_order, total_distance, total_time, total_cost
+# At the end of run_vrp_from_forecast return:
+    return m, route_order, total_distance, total_time, total_cost, lead_times

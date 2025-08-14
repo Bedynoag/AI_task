@@ -1,45 +1,53 @@
-import streamlit as st
+import os
+import re
+import json
+import uuid
+import math
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-import numpy as np
-import re
+import streamlit as st
+from summary_agent import ExecutiveSummaryAgent
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime
+from dotenv import load_dotenv
+
 from data_loader import DataLoader
+from checking import run_vrp_from_forecast
+from streamlit_folium import st_folium
+
+# LangChain imports (parsing only)
 from langchain.prompts import PromptTemplate
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import OpenAIEmbeddings
 from langchain_openai import ChatOpenAI
 from langchain_core.runnables import RunnableSequence
-from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
-from dotenv import load_dotenv
-import os
-import json
-import uuid
-from checking import run_vrp_from_forecast
-from streamlit_folium import st_folium
 
 # Load environment variables
 load_dotenv()
 
+
 class ForecastingChatbot:
     """RAG-based chatbot for handling forecasting queries with context awareness"""
-    
+
     def __init__(self):
         self.data_loader = DataLoader()
         self.chat_history = []
+
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
-            raise ValueError("OPENAI_API_KEY not found in environment. Make sure it's defined in your .env file.")
-        
+            raise ValueError(
+                "OPENAI_API_KEY not found in environment. Make sure it's defined in your .env file."
+            )
+
         self.llm = ChatOpenAI(
             model_name="gpt-3.5-turbo",
             openai_api_key=api_key
         )
         self.vector_store = None
         self.setup_vector_store()
-    
+
     def setup_vector_store(self):
         """Initialize FAISS vector store with product, calendar, and range data"""
         try:
@@ -53,47 +61,43 @@ class ForecastingChatbot:
                     documents.append(f"{row['store']} {row['category']} range: {row['range']}")
             if self.data_loader.calendar_data is not None:
                 for _, row in self.data_loader.calendar_data.iterrows():
-                    if pd.notna(row['event_name_1']):
-                        event_date = row['date'].strftime('%Y-%m-%d') if pd.notna(row['date']) else f"day {row['d']}"
+                    if pd.notna(row.get('event_name_1')):
+                        event_date = row['date'].strftime('%Y-%m-%d') if pd.notna(row.get('date')) else f"day {row['d']}"
                         documents.append(f"Date {event_date}: {row['event_name_1']} ({row['event_type_1']})")
-                    if pd.notna(row['event_name_2']):
-                        event_date = row['date'].strftime('%Y-%m-%d') if pd.notna(row['date']) else f"day {row['d']}"
+                    if pd.notna(row.get('event_name_2')):
+                        event_date = row['date'].strftime('%Y-%m-%d') if pd.notna(row.get('date')) else f"day {row['d']}"
                         documents.append(f"Date {event_date}: {row['event_name_2']} ({row['event_type_2']})")
-            
+
             if documents:
                 embeddings = OpenAIEmbeddings(openai_api_key=os.getenv("OPENAI_API_KEY"))
                 self.vector_store = FAISS.from_texts(documents, embeddings)
         except Exception as e:
             st.error(f"Error setting up vector store: {str(e)}")
-    
+
     def _validate_date_range(self, start_date: str, end_date: str) -> Optional[Tuple[datetime, datetime]]:
-        """Validate and parse date range in YYYY-MM-DD or DD-MM-YYYY format"""
+        """Validate and parse date range in YYYY-MM-DD or DD-MM-YYYY format (for chart only)"""
         try:
-            # Try YYYY-MM-DD first
-            start_dt = pd.to_datetime(start_date, format='%Y-%m-%d', errors='coerce')
-            end_dt = pd.to_datetime(end_date, format='%Y-%m-%d', errors='coerce')
+            start_dt = pd.to_datetime(start_date, dayfirst=False, errors='coerce')
+            end_dt = pd.to_datetime(end_date, dayfirst=False, errors='coerce')
             if pd.isna(start_dt) or pd.isna(end_dt):
-                # Try DD-MM-YYYY
-                start_dt = pd.to_datetime(start_date, format='%d-%m-%Y', errors='coerce')
-                end_dt = pd.to_datetime(end_date, format='%d-%m-%Y', errors='coerce')
-            if pd.isna(start_dt) or pd.isna(end_dt):
-                st.error(f"Invalid date format for {start_date} or {end_date}. Expected: YYYY-MM-DD or DD-MM-YYYY.")
+                st.error(f"Invalid date format for {start_date} or {end_date}. Use YYYY-MM-DD.")
                 return None
             if start_dt > end_dt:
                 st.error(f"Start date {start_date} is after end date {end_date}.")
                 return None
-            # Ensure dates are within calendar data range
-            if self.data_loader.calendar_data is not None:
-                min_date = self.data_loader.calendar_data['date'].min()
-                max_date = self.data_loader.calendar_data['date'].max()
-                if start_dt < min_date or end_dt > max_date:
-                    st.error(f"Dates must be between {min_date.strftime('%Y-%m-%d')} and {max_date.strftime('%Y-%m-%d')}.")
-                    return None
+
+            # Allowed forecast window for charting
+            eval_min = pd.to_datetime("2016-05-23")
+            eval_max = pd.to_datetime("2016-06-19")
+            if start_dt < eval_min or end_dt > eval_max:
+                st.error(f"Forecast must be between {eval_min.strftime('%Y-%m-%d')} and {eval_max.strftime('%Y-%m-%d')}")
+                return None
+
             return (start_dt, end_dt)
         except Exception as e:
             st.error(f"Error parsing dates: {str(e)}")
             return None
-    
+
     def parse_query(self, query: str, prev_query: Optional[Dict] = None) -> Dict:
         """Parse user query using LLM to extract category, item, store(s), and date range"""
         prompt_template = PromptTemplate(
@@ -104,46 +108,28 @@ class ForecastingChatbot:
             - Item number (three-digit number, e.g., '001', default '001' if not specified)
             - Store(s) (one or more of: {stores}, or state codes CA, TX, WI for all stores in that state, or 'all stores')
             - Date range (format 'YYYY-MM-DD to YYYY-MM-DD' or 'DD-MM-YYYY to DD-MM-YYYY', or None if not specified)
-            
+
             Map simplified categories to data categories only if no specific sub-category is provided:
             - HOBBIES -> HOBBIES_1 or HOBBIES_2 (default to HOBBIES_1 if item starts with '1', else HOBBIES_2)
             - HOUSEHOLD -> HOUSEHOLD_1 or HOUSEHOLD_2 (default to HOUSEHOLD_1 if item starts with '1', else HOUSEHOLD_2)
             - FOODS -> FOODS_1, FOODS_2, or FOODS_3 (default to FOODS_3 for items like '001')
-            
+
             If the query specifies a sub-category (e.g., FOODS_1_001 or FOODS_1), preserve it as the category unless invalid.
             If the query references a previous query (e.g., "instead of CA_2 show TX_1" or "add TX_1 and remove CA_2"):
             - Use the previous query to fill in missing fields (category, item, date range).
             - For stores, start with the previous query's stores if available.
             - If 'add' or synonym of 'add' word is in the query, include new stores in the store list.
             - If 'remove' or synonym of 'remove' word is in the query, exclude specified stores from the store list.
-            
+
             If a state code (CA, TX, WI) is provided, include all stores in that state (e.g., CA -> CA_1, CA_2, CA_3, CA_4).
-            
-            For long or complex queries, focus on extracting only the relevant components (category, item, stores, date range) and ignore extraneous details unrelated to forecasting. For example:
-            - Query: "Show me the forecast for FOODS_1 item 001 in California stores, but exclude CA_2, include TX_1, and focus on the period from May 23, 2016, to June 19, 2016, with insights on sales trends"
-            - Category: FOODS_1
-            - Item: 001
-            - Stores: CA_1, CA_3, CA_4, TX_1
-            - Date range: 2016-05-23 to 2016-06-19
-            - Query: "Show forecasting of FOODS_1_001 in CA from 2016-05-23 to 2016-06-19"
-            - Category: FOODS_1
-            - Item: 001
-            - Stores: CA_1, CA_2, CA_3, CA_4
-            - Date range: 2016-05-23 to 2016-06-19
-            - Query: "I want a detailed analysis of HOBBIES_002 in TX stores for the last month of data available, please include all Texas stores and skip WI stores"
-            - Category: HOBBIES
-            - Item: 002
-            - Stores: TX_1, TX_2, TX_3
-            - Date range: None (use max available date range)
-            
-            If the query is out of context (e.g., unrelated to retail forecasting), return an error message.
+
             Return a JSON object with 'category', 'item', 'stores', 'date_range', 'error' (null if valid, else error message).
-            
+
             Query: {query}
             Previous Query: {prev_query}
             """
         )
-        
+
         all_stores = ['CA_1', 'CA_2', 'CA_3', 'CA_4', 'TX_1', 'TX_2', 'TX_3', 'WI_1', 'WI_2', 'WI_3']
         data_categories = ['HOBBIES_1', 'HOBBIES_2', 'HOUSEHOLD_1', 'HOUSEHOLD_2', 'FOODS_1', 'FOODS_2', 'FOODS_3']
         state_to_stores = {
@@ -151,11 +137,9 @@ class ForecastingChatbot:
             'TX': ['TX_1', 'TX_2', 'TX_3'],
             'WI': ['WI_1', 'WI_2', 'WI_3']
         }
-        
-        chain = RunnableSequence(
-            prompt_template | self.llm | JsonOutputParser()
-        )
-        
+
+        chain = RunnableSequence(prompt_template | self.llm | JsonOutputParser())
+
         try:
             response = chain.invoke({
                 "query": query,
@@ -163,12 +147,12 @@ class ForecastingChatbot:
                 "categories": ", ".join(['HOBBIES', 'HOUSEHOLD', 'FOODS'] + data_categories),
                 "stores": ", ".join(all_stores + ['CA', 'TX', 'WI', 'all stores'])
             })
-            
             parsed = response
+
             if parsed.get('error'):
                 return parsed
-            
-            # Validate and fill in missing fields using prev_query
+
+            # Fill missing fields from prev_query
             if prev_query and not parsed.get('error'):
                 if not parsed.get('category') and prev_query.get('category'):
                     parsed['category'] = prev_query['category']
@@ -178,29 +162,35 @@ class ForecastingChatbot:
                     parsed['date_range'] = prev_query['date_range']
                 if not parsed.get('stores') and prev_query.get('stores'):
                     parsed['stores'] = prev_query['stores']
-            
-            # Map simplified category to data category only if no specific sub-category is provided
+
+            # Category normalization
             item = parsed.get('item', '001')
+            data_categories_set = set(data_categories)
             if parsed.get('category'):
                 category_input = parsed['category'].upper()
-                if category_input in data_categories:
-                    parsed['category'] = category_input  # Preserve if already a valid sub-category
+                if category_input in data_categories_set:
+                    parsed['category'] = category_input
                 elif category_input == 'HOBBIES':
                     parsed['category'] = 'HOBBIES_1' if item.startswith('1') else 'HOBBIES_2'
                 elif category_input == 'HOUSEHOLD':
                     parsed['category'] = 'HOUSEHOLD_1' if item.startswith('1') else 'HOUSEHOLD_2'
                 elif category_input == 'FOODS':
-                    parsed['category'] = 'FOODS_3'  # Default to FOODS_3 for FOODS_001
-                elif parsed['category'] not in data_categories:
-                    parsed['error'] = f"Invalid category: {parsed['category']}. Must be one of: HOBBIES, HOUSEHOLD, FOODS, or sub-categories like HOBBIES_1, FOODS_1"
+                    parsed['category'] = 'FOODS_3'  # default for 001-like
+                else:
+                    parsed['error'] = (
+                        f"Invalid category: {parsed['category']}. "
+                        f"Must be one of: HOBBIES, HOUSEHOLD, FOODS, or sub-categories like HOBBIES_1, FOODS_1"
+                    )
                     return parsed
-            
-            # Validate category
-            if not parsed.get('category') or parsed['category'] not in data_categories:
-                parsed['error'] = f"Invalid or missing category. Must be one of: HOBBIES, HOUSEHOLD, FOODS, or sub-categories like HOBBIES_1, FOODS_1"
+
+            if not parsed.get('category') or parsed['category'] not in data_categories_set:
+                parsed['error'] = (
+                    "Invalid or missing category. Must be one of: "
+                    "HOBBIES, HOUSEHOLD, FOODS, or sub-categories like HOBBIES_1, FOODS_1"
+                )
                 return parsed
-            
-            # Handle stores with add/remove logic and state code expansion
+
+            # Stores handling and state expansion
             base_stores = prev_query['stores'] if prev_query and prev_query.get('stores') else []
             if not parsed.get('stores'):
                 parsed['stores'] = base_stores if base_stores else all_stores
@@ -215,338 +205,340 @@ class ForecastingChatbot:
             elif isinstance(parsed['stores'], list):
                 expanded_stores = []
                 for store in parsed['stores']:
-                    store_upper = store.upper()
-                    if store_upper in state_to_stores:
-                        expanded_stores.extend(state_to_stores[store_upper])
+                    su = str(store).upper()
+                    if su in state_to_stores:
+                        expanded_stores.extend(state_to_stores[su])
                     else:
                         expanded_stores.append(store)
                 parsed['stores'] = list(set(expanded_stores))
-            
-            # Apply add/remove logic
+
+            # Add/remove logic relative to prev_query
+            # Add/remove logic relative to prev_query
             if prev_query and base_stores:
-                if 'add' in query.lower() or 'remove' in query.lower():
-                    final_stores = set(base_stores)
-                    # Add new stores
-                    if 'add' in query.lower():
-                        for store in parsed['stores']:
-                            store_upper = store.upper()
-                            if store_upper in state_to_stores:
-                                final_stores.update(state_to_stores[store_upper])
-                            else:
-                                final_stores.add(store)
-                    # Remove specified stores
-                    if 'remove' in query.lower():
-                        stores_to_remove = []
-                        for store in all_stores:
-                            if f"remove {store.lower()}" in query.lower() or f"remove {store}" in query.lower():
-                                stores_to_remove.append(store)
-                        for state in state_to_stores:
-                            if f"remove {state.lower()}" in query.lower() or f"remove {state}" in query.lower():
-                                stores_to_remove.extend(state_to_stores[state])
-                        final_stores.difference_update(stores_to_remove)
-                    parsed['stores'] = list(final_stores) if final_stores else parsed['stores']
-            
-            # Validate store names
+                ql = query.lower()
+                final_stores = set(base_stores)
+
+                # Add
+                if "add" in ql:
+                    for store in parsed.get("stores", []):
+                        su = store.upper()
+                        if su in state_to_stores:
+                            final_stores.update(state_to_stores[su])
+                        else:
+                            final_stores.add(store)
+
+                # Remove
+                if "remove" in ql:
+                    for store in all_stores:
+                        if f"remove {store.lower()}" in ql or f"remove {store}" in ql:
+                            final_stores.discard(store)
+                    for state in state_to_stores:
+                        if f"remove {state.lower()}" in ql or f"remove {state}" in ql:
+                            for s in state_to_stores[state]:
+                                final_stores.discard(s)
+
+                parsed['stores'] = sorted(final_stores)
+
+
+            # Validate stores
             for store in parsed['stores']:
                 if store not in all_stores:
                     parsed['error'] = f"Invalid store: {store}. Must be one of: {', '.join(all_stores)}"
                     return parsed
-            
-            # Validate item number
-            if not parsed.get('item') or not re.match(r'^\d{3}$', parsed['item']):
+
+            # Item validation
+            if not parsed.get('item') or not re.match(r'^\d{3}$', str(parsed['item'])):
                 parsed['item'] = '001'
-            
-            # Validate date range
+
+            # Date range validation (chart only)
             if parsed.get('date_range') and ' to ' in parsed['date_range']:
                 start_date, end_date = parsed['date_range'].split(' to ')
                 date_range = self._validate_date_range(start_date, end_date)
                 if not date_range:
                     parsed['error'] = "Invalid date range"
                     return parsed
-            
+
             return parsed
         except Exception as e:
             return {'error': f"Error parsing query: {str(e)}"}
-    
-    def get_forecast_data(self, category: str, item: str, store: str, date_range: Optional[Tuple[datetime, datetime]]) -> Optional[pd.DataFrame]:
-        """Retrieve forecast data for a specific product and store, filtered by date range"""
+
+    def get_forecast_data(
+        self,
+        category: str,
+        item: str,
+        store: str,
+        date_range: Optional[Tuple[datetime, datetime]]
+    ) -> Optional[pd.DataFrame]:
+        """
+        Retrieve forecast data for a specific product and store, filtered by date range (for chart).
+        Calculations (EOQ/SS/ROP) ignore this range and use full rows.
+        """
         try:
             product_id_val = f"{category}_{item}_{store}_validation"
             product_id_eval = f"{category}_{item}_{store}_evaluation"
-            
-            # Initialize empty DataFrame
+
             forecast_data = pd.DataFrame()
-            
-            # Get validation data (up to 2016-05-22, day 1941)
+
             if self.data_loader.forecast_data_val is not None:
                 val_data = self.data_loader.forecast_data_val[
                     self.data_loader.forecast_data_val['id'] == product_id_val
                 ]
                 if not val_data.empty:
                     forecast_data = val_data
-            
-            # Get evaluation data (2016-05-23 to 2016-06-19, days 1942-1969)
+
             if self.data_loader.forecast_data_eval is not None:
                 eval_data = self.data_loader.forecast_data_eval[
                     self.data_loader.forecast_data_eval['id'] == product_id_eval
                 ]
                 if not eval_data.empty:
                     forecast_data = pd.concat([forecast_data, eval_data], axis=1)
-                    # Remove duplicate 'id' column if present
                     if forecast_data.columns.duplicated().any():
                         forecast_data = forecast_data.loc[:, ~forecast_data.columns.duplicated()]
-            
+
             if forecast_data.empty:
                 return None
-            
-            # Filter by date range if provided
-            if date_range and self.data_loader.calendar_data is not None:
+
+            # For chart display only (optional range filter)
+            if self.data_loader.calendar_data is not None and date_range:
                 start_dt, end_dt = date_range
-                calendar_subset = self.data_loader.calendar_data[
+                history_days = self.data_loader.calendar_data[
+                    self.data_loader.calendar_data['date'] < pd.to_datetime("2016-05-22")
+                ]['d'].astype(str).tolist()
+
+                forecast_days = self.data_loader.calendar_data[
                     (self.data_loader.calendar_data['date'] >= start_dt) &
                     (self.data_loader.calendar_data['date'] <= end_dt)
-                ]
-                day_columns = [str(d) for d in calendar_subset['d'] if str(d) in forecast_data.columns]
-                if not day_columns:
+                ]['d'].astype(str).tolist()
+
+                all_days = [d for d in history_days + forecast_days if d in forecast_data.columns]
+                if not all_days:
                     return None
-                forecast_data = forecast_data[['id'] + day_columns]
-            
+                forecast_data = forecast_data[['id'] + all_days]
+
             return forecast_data
         except Exception as e:
             st.error(f"Error retrieving forecast data: {str(e)}")
             return None
-    
-    def create_forecast_chart(self, data_dict: Dict[str, pd.DataFrame], category: str, item: str, stores: List[str], date_range: Optional[Tuple[datetime, datetime]]) -> Optional[go.Figure]:
-        """Create a Plotly chart for forecast data with event and SNAP markers"""
+
+    def create_forecast_chart(self, data_dict, category, item, stores, date_range):
         try:
             fig = go.Figure()
-            
-            # Determine day columns and corresponding dates
-            all_days = []
-            for data in data_dict.values():
-                all_days.extend([col for col in data.columns if re.match(r'^\d+$', col)])
-            all_days = sorted(list(set(all_days)))
-            
-            if not all_days:
-                return None
-            
+            split_date = pd.to_datetime('2016-05-22')  # boundary between history & forecast
+
             # Map days to dates
             date_map = {}
             if self.data_loader.calendar_data is not None:
                 for _, row in self.data_loader.calendar_data.iterrows():
                     if pd.notna(row['d']) and pd.notna(row['date']):
                         date_map[str(row['d'])] = row['date']
-            
-            # Filter days by date range
-            if date_range:
-                start_dt, end_dt = date_range
-                all_days = [
-                    d for d in all_days
-                    if d in date_map and start_dt <= date_map[d] <= end_dt
-                ]
-            
-            # Add traces for each store
-            split_date = pd.to_datetime('2016-05-22')
+
+            # --- Plot store lines ---
             for store, data in data_dict.items():
-                dates = []
-                values = []
-                for d in all_days:
-                    if d in data.columns and d in date_map:
-                        dates.append(date_map[d])
-                        values.append(float(data[d].iloc[0]) if pd.notna(data[d].iloc[0]) else 0)
-                
-                # Split into validation (up to 2016-05-22) and evaluation (after)
-                val_dates = [d for d, v in zip(dates, values) if d <= split_date]
-                val_values = [v for d, v in zip(dates, values) if d <= split_date]
-                eval_dates = [d for d, v in zip(dates, values) if d > split_date]
-                eval_values = [v for d, v in zip(dates, values) if d > split_date]
-                
-                # Validation trace (dotted)
-                if val_dates:
+                all_day_cols = [col for col in data.columns if col.isdigit()]
+                dates = [date_map[d] for d in all_day_cols if d in date_map]
+                values = [float(data[d].iloc[0]) if pd.notna(data[d].iloc[0]) else 0 for d in all_day_cols if d in date_map]
+
+                # Separate historical and forecast
+                hist_dates = [d for d in dates if d <= split_date]
+                hist_values = [v for d, v in zip(dates, values) if d <= split_date]
+
+                if date_range:
+                    start_dt, end_dt = date_range
+                    forecast_dates = [d for d in dates if d > split_date and start_dt <= d <= end_dt]
+                    forecast_values = [v for d, v in zip(dates, values) if d > split_date and start_dt <= d <= end_dt]
+                else:
+                    forecast_dates = [d for d in dates if d > split_date]
+                    forecast_values = [v for d, v in zip(dates, values) if d > split_date]
+
+                # Plot historical
+                if hist_dates:
                     fig.add_trace(go.Scatter(
-                        x=val_dates,
-                        y=val_values,
+                        x=hist_dates,
+                        y=hist_values,
                         mode='lines+markers',
-                        name=f"{store} (Past)",
+                        name=f"{store} (Historical)",
                         line=dict(dash='dot'),
                         marker=dict(size=6)
                     ))
-                
-                # Evaluation trace (solid)
-                if eval_dates:
+
+                # Plot forecast
+                if forecast_dates:
                     fig.add_trace(go.Scatter(
-                        x=eval_dates,
-                        y=eval_values,
+                        x=forecast_dates,
+                        y=forecast_values,
                         mode='lines+markers',
                         name=f"{store} (Forecast)",
                         line=dict(dash='solid'),
                         marker=dict(size=6)
                     ))
-            
-            # Add event markers with stacked annotations
+
+            # --- Add special day and SNAP markers with offset to avoid overlap ---
+            # --- Add special day (top) and SNAP markers (bottom) ---
+            # --- Add special day (top) and SNAP markers (bottom) with independent overlap control ---
             if self.data_loader.calendar_data is not None:
-                events = self.data_loader.calendar_data[
-                    self.data_loader.calendar_data['event_name_1'].notna() |
-                    self.data_loader.calendar_data['event_name_2'].notna()
-                ]
-                event_dates = events.groupby('date').agg({'event_name_1': lambda x: x.dropna().tolist(), 'event_name_2': lambda x: x.dropna().tolist()}).reset_index()
-                for _, row in event_dates.iterrows():
-                    date = row['date']
-                    if date_range and (date < start_dt or date > end_dt):
+                cal_df = self.data_loader.calendar_data.copy()
+
+                if date_range:
+                    start_dt, end_dt = date_range
+                    cal_df = cal_df[(cal_df['date'] >= start_dt) & (cal_df['date'] <= end_dt)]
+
+                from datetime import timedelta
+
+                # Find Y max/min for placing labels
+                all_y = [y for trace in fig.data for y in trace.y if trace.y is not None]
+                if not all_y:
+                    all_y = [0]
+                y_max = max(all_y)
+                y_min = min(all_y)
+
+                # Separate counters for top and bottom
+                used_top_positions = {}    # For events
+                used_bottom_positions = {} # For SNAP markers
+
+                for _, row in cal_df.iterrows():
+                    date_val = row['date']
+                    if pd.isna(date_val):
                         continue
-                    event_names = [name for sublist in [row['event_name_1'], row['event_name_2']] for name in sublist if pd.notna(name)]
-                    if event_names:
-                        for i, event_name in enumerate(event_names):
-                            y_offset = 1.1 - (i * 0.1)  # Stack annotations vertically (e.g., 1.1, 1.0, 0.9)
-                            fig.add_vline(
-                                x=date.timestamp() * 1000,
-                                line=dict(color='red' if i == 0 else 'purple', dash='dash'),
-                                annotation_text=event_name,
-                                annotation_position='top left',
-                                annotation=dict(y=y_offset, yref="paper", showarrow=False)
+
+                    # --- Special events (top) ---
+                    if pd.notna(row.get('event_name_1')) or pd.notna(row.get('event_name_2')):
+                        top_count = used_top_positions.get(date_val, 0)
+                        y_offset_top = 12 + (top_count * 14)
+
+                        event_label = row.get('event_name_1') or row.get('event_name_2')
+                        fig.add_vline(x=date_val, line=dict(color="red", dash="dash"), opacity=0.6)
+                        fig.add_annotation(
+                            x=date_val,
+                            y=y_max,
+                            text=str(event_label),
+                            showarrow=False,
+                            yshift=y_offset_top,
+                            font=dict(size=9, color="red"),
+                            textangle=30
+                        )
+                        used_top_positions[date_val] = top_count + 1
+
+                    # --- SNAP markers (bottom) ---
+                    snap_colors = {"snap_CA": "blue", "snap_TX": "green", "snap_WI": "purple"}
+                    for snap_col, color in snap_colors.items():
+                        if snap_col in row and row[snap_col] == 1:
+                            bottom_count = used_bottom_positions.get(date_val, 0)
+                            y_offset_bottom = -12 - (bottom_count * 14)
+
+                            fig.add_vline(x=date_val, line=dict(color=color, dash="dot"), opacity=0.5)
+                            fig.add_annotation(
+                                x=date_val,
+                                y=y_min,
+                                text=snap_col.upper(),
+                                showarrow=False,
+                                yshift=y_offset_bottom,
+                                font=dict(size=8, color=color),
+                                textangle=30
                             )
-            
-            # Add SNAP markers with stacked annotations
-            if self.data_loader.calendar_data is not None:
-                snap_dates = self.data_loader.calendar_data[
-                    (self.data_loader.calendar_data['snap_CA'] == 1) |
-                    (self.data_loader.calendar_data['snap_TX'] == 1) |
-                    (self.data_loader.calendar_data['snap_WI'] == 1)
-                ]
-                snap_grouped = snap_dates.groupby('date').agg({
-                    'snap_CA': 'sum',
-                    'snap_TX': 'sum',
-                    'snap_WI': 'sum'
-                }).reset_index()
-                for _, row in snap_grouped.iterrows():
-                    date = row['date']
-                    if date_range and (date < start_dt or date > end_dt):
-                        continue
-                    snap_states = []
-                    if row['snap_CA'] > 0:
-                        snap_states.append("CA")
-                    if row['snap_TX'] > 0:
-                        snap_states.append("TX")
-                    if row['snap_WI'] > 0:
-                        snap_states.append("WI")
-                    if snap_states:
-                        for i, state in enumerate(snap_states):
-                            y_offset = 0.1 + (i * 0.1)  # Stack annotations vertically from bottom (e.g., 0.1, 0.2, 0.3)
-                            fig.add_vline(
-                                x=date.timestamp() * 1000,
-                                line=dict(color='green', dash='dot', width=1),
-                                annotation_text=f"SNAP {state}",
-                                annotation_position='bottom left',
-                                annotation=dict(y=y_offset, yref="paper", showarrow=False)
-                            )
-            
-            # Update layout
+                            used_bottom_positions[date_val] = bottom_count + 1
+
+
+
+
             fig.update_layout(
                 title=f"Forecast for {category}_{item} in {', '.join(stores)}",
                 xaxis_title="Date",
                 yaxis_title="Sales (Units)",
-                showlegend=True,
                 template='plotly_white',
                 hovermode='x unified'
             )
-            
+
             return fig
         except Exception as e:
             st.error(f"Error creating chart: {str(e)}")
             return None
-    
-    def generate_insights(self, data_dict: Dict[str, pd.DataFrame], category: str, item: str, stores: List[str]) -> str:
-        """Generate per-store insights from forecast data"""
+
+
+
+
+    def generate_insights(self, parsed_query: Dict, forecast_data_dict: Dict[str, pd.DataFrame]) -> List[Dict]:
+        """
+        Generate inventory metrics per store using full rows (no date-range filtering):
+        EOQ = sqrt((2 * Demand * OrderingCost) / HoldingCost)
+        Safety Stock = Z * σ * sqrt(LeadTime)
+        Reorder Point = (AvgDemand * LeadTime) + Safety Stock
+
+        Demand & AvgDemand -> ALL evaluation columns
+        σ (std dev) -> ALL validation columns
+        LeadTime -> from VRP (hours) converted to days
+        """
+        category = parsed_query['category']
+        item = parsed_query['item']
+        stores = parsed_query['stores']
+
+        # --- Business constants (adjust to your real values) ---
+        ORDERING_COST = 50.0     # Cost per order
+        HOLDING_COST = 2.0       # Cost per unit per year
+        Z = 1.65                 # ~95% service level
+
+        # Pre-fetch VRP lead times (in hours) across selected stores
         try:
-            insights = []
-            date_map = {}
-            if self.data_loader.calendar_data is not None:
-                for _, row in self.data_loader.calendar_data.iterrows():
-                    if pd.notna(row['d']) and pd.notna(row['date']):
-                        date_map[str(row['d'])] = row['date']
-            
-            for store in stores:
-                if store not in data_dict:
-                    insights.append(f"**{store}**: No forecast data available.")
-                    continue
-                
-                data = data_dict[store]
-                date_columns = [col for col in data.columns if re.match(r'^\d+$', col)]
-                if not date_columns:
-                    insights.append(f"**{store}**: No forecast data available for the specified period.")
-                    continue
-                
-                # Collect sales data for this store
-                values = []
-                for d in date_columns:
-                    if pd.notna(data[d].iloc[0]):
-                        values.append(float(data[d].iloc[0]))
-                
-                if not values:
-                    insights.append(f"**{store}**: No valid sales data available.")
-                    continue
-                
-                # Calculate metrics
-                avg_sales = np.mean(values)
-                max_sales = np.max(values)
-                min_sales = np.min(values)
-                total_sales = np.sum(values)
-                trend_slope = np.polyfit(range(len(values)), values, 1)[0] if len(values) > 1 else 0
-                trend_direction = "increasing" if trend_slope > 0 else "decreasing" if trend_slope < 0 else "stable"
-                
-                # Event impact for this store
-                event_insight = ""
-                if self.data_loader.calendar_data is not None:
-                    event_days = self.data_loader.calendar_data[
-                        self.data_loader.calendar_data['event_name_1'].notna() |
-                        self.data_loader.calendar_data['event_name_2'].notna()
-                    ]
-                    event_sales = []
-                    for _, row in event_days.iterrows():
-                        d = str(row['d'])
-                        if d in date_columns and pd.notna(data[d].iloc[0]):
-                            event_sales.append(float(data[d].iloc[0]))
-                    if event_sales:
-                        avg_event_sales = np.mean(event_sales)
-                        event_insight = f"\n• **Event Impact**: Average sales on event days: {avg_event_sales:.1f} units (vs. {avg_sales:.1f} overall)."
-                
-                # SNAP impact for this store
-                snap_insight = ""
-                state = store.split('_')[0]
-                snap_col = f'snap_{state}'
-                if self.data_loader.calendar_data is not None and snap_col in self.data_loader.calendar_data.columns:
-                    snap_dates = self.data_loader.calendar_data[
-                        self.data_loader.calendar_data[snap_col] == 1
-                    ]['d'].astype(str).tolist()
-                    snap_sales = []
-                    for d in date_columns:
-                        if d in snap_dates and pd.notna(data[d].iloc[0]):
-                            snap_sales.append(float(data[d].iloc[0]))
-                    if snap_sales:
-                        avg_snap_sales = np.mean(snap_sales)
-                        snap_insight = f"\n• **SNAP Impact ({state})**: Average sales on SNAP days: {avg_snap_sales:.1f} units (vs. {avg_sales:.1f} overall)."
-                
-                # Format insights for this store
-                store_insights = f"""
-                **{store} Insights for {category}_{item}:**
-                • **Average Daily Sales**: {avg_sales:.1f} units
-                • **Peak Sales**: {max_sales:.0f} units
-                • **Minimum Sales**: {min_sales:.0f} units
-                • **Total Forecast**: {total_sales:.0f} units over {len(date_columns)} days
-                • **Trend**: Sales are {trend_direction} (slope: {trend_slope:.3f})
-                {event_insight}
-                {snap_insight}
-                • **Sales Volatility**: {np.std(values):.2f}
-                • **Non-zero Sales Days**: {len([v for v in values if v > 0])}/{len(date_columns)} days
-                """
-                insights.append(store_insights)
-            
-            if not insights:
-                return "No forecast data available for insights."
-            
-            return "\n\n".join(insights)
-        except Exception as e:
-            return f"Error generating insights: {str(e)}"
+            # run_vrp_from_forecast returns: m, route_order, total_distance, total_time, total_cost, lead_times
+            vrp_result = run_vrp_from_forecast(parsed_query, forecast_data_dict)
+            if vrp_result and len(vrp_result) >= 6:
+                lead_times = vrp_result[5]  # dict: {store_code: hours}
+            else:
+                lead_times = {s: 0.0 for s in stores}
+        except Exception:
+            lead_times = {s: 0.0 for s in stores}
+
+        results = []
+
+        for store in stores:
+            sku_eval = f"{category}_{item}_{store}_evaluation"
+            sku_val = f"{category}_{item}_{store}_validation"
+
+            # --- Forecast demand (use ALL evaluation days) ---
+            eval_df = self.data_loader.forecast_data_eval
+            eval_row = eval_df[eval_df["id"] == sku_eval] if eval_df is not None else pd.DataFrame()
+            eval_vals = []
+            if not eval_row.empty:
+                eval_vals = pd.to_numeric(
+                    eval_row.drop(columns=["id"], errors="ignore").values.flatten(),
+                    errors="coerce"
+                )
+                eval_vals = eval_vals[~np.isnan(eval_vals)]
+            demand_forecast = float(np.sum(eval_vals)) if len(eval_vals) else 0.0
+            avg_demand_forecast = float(np.mean(eval_vals)) if len(eval_vals) else 0.0
+
+            # --- Historical σ (use ALL validation days) ---
+            val_df = self.data_loader.forecast_data_val
+            val_row = val_df[val_df["id"] == sku_val] if val_df is not None else pd.DataFrame()
+            val_vals = []
+            if not val_row.empty:
+                val_vals = pd.to_numeric(
+                    val_row.drop(columns=["id"], errors="ignore").values.flatten(),
+                    errors="coerce"
+                )
+                val_vals = val_vals[~np.isnan(val_vals)]
+            sigma = float(np.std(val_vals, ddof=1)) if len(val_vals) > 1 else 0.0
+
+            # --- Lead time from VRP (convert hours -> days) ---
+            lead_time_hours = float(lead_times.get(store, 0.0))
+            lead_time_days = lead_time_hours / 24.0 if lead_time_hours > 0 else 0.0
+
+            # --- Calculations ---
+            # EOQ uses total forecast demand (future-focused)
+            eoq = math.sqrt((2.0 * max(demand_forecast, 0.0) * ORDERING_COST) / max(HOLDING_COST, 1e-9)) if demand_forecast > 0 else 0.0
+            # Safety Stock uses historical variability and sqrt(LeadTime)
+            safety_stock = Z * sigma * math.sqrt(lead_time_days) if lead_time_days > 0 else 0.0
+            # ROP uses avg forecast demand over lead time plus safety stock
+            reorder_point = (avg_demand_forecast * lead_time_days) + safety_stock
+
+            results.append({
+                "SKU_ID": f"{category}_{item}_{store}",
+                "EOQ": round(eoq, 2),
+                "ReorderPoint": round(reorder_point, 2),
+                "SafetyStock": round(safety_stock, 2)
+            })
+
+        return results
+
 
 def main():
     """Main Streamlit application"""
@@ -555,10 +547,14 @@ def main():
         page_icon="📈",
         layout="wide"
     )
-    
+
     st.title("🤖 Forecasting Chatbot")
-    st.markdown("Ask about product forecasting across stores! See past (up to 2016-05-22, dotted line) and future (2016-05-23 to 2016-06-19, solid line) predictions with special event and SNAP markers. Use state codes (CA, TX, WI) for all stores in a state.")
-    
+    st.markdown(
+        "Ask about product forecasting across stores! "
+        "Past (up to 2016-05-22, dotted) and future (2016-05-23 to 2016-06-19, solid) with events/SNAP markers. "
+        "Use state codes (CA, TX, WI) for all stores in a state."
+    )
+
     if 'chatbot' not in st.session_state:
         st.session_state.chatbot = ForecastingChatbot()
         st.session_state.chat_history = []
@@ -574,59 +570,50 @@ def main():
             )
         except Exception as e:
             st.error(f"Failed to load data files: {str(e)}")
-    
+
     with st.sidebar:
         st.header("📝 Example Queries")
         st.markdown("""
-        Try asking questions like:
         • "Show forecasting of FOODS_1_001 in CA from 2016-05-23 to 2016-06-19"
         • "Show forecasting of FOODS_001 in CA from 23-05-2016 to 19-06-2016"
         • "Forecast for HOBBIES_002 in all stores"
         • "Household products forecast for TX_1"
         • "Instead of CA_2, show TX_1 for FOODS_1_001"
         • "Add TX_1 and remove CA_2"
-        • "Show me the forecast for FOODS_1 item 001 in California stores, but exclude CA_2, include TX_1, and focus on the period from May 23, 2016, to June 19, 2016, with insights on sales trends"
         """)
-        
+
         st.header("🏪 Available Options")
         st.markdown("""
-        **Categories:**
-        - HOBBIES (HOBBIES_1, HOBBIES_2)
-        - HOUSEHOLD (HOUSEHOLD_1, HOUSEHOLD_2)
-        - FOODS (FOODS_1, FOODS_2, FOODS_3)
-        
-        **Stores:**
-        - CA_1, CA_2, CA_3, CA_4
-        - TX_1, TX_2, TX_3
-        - WI_1, WI_2, WI_3
-        - Or use state codes: CA, TX, WI
-        
-        **Items:**
-        - 001, 002, 003, etc. (default: 001)
-        
-        **Date Ranges:**
-        - Past: up to 2016-05-22 (dotted line)
-        - Future: 2016-05-23 to 2016-06-19 (solid line)
-        - Format: YYYY-MM-DD or DD-MM-YYYY
+        **Categories:** HOBBIES (HOBBIES_1, HOBBIES_2), HOUSEHOLD (HOUSEHOLD_1, HOUSEHOLD_2), FOODS (FOODS_1, FOODS_2, FOODS_3)
+
+        **Stores:** CA_1, CA_2, CA_3, CA_4, TX_1, TX_2, TX_3, WI_1, WI_2, WI_3 (or CA, TX, WI)
+
+        **Items:** 001, 002, 003, ... (default: 001)
+
+        **Date Range (chart only):** 2016-05-23 to 2016-06-19 (YYYY-MM-DD or DD-MM-YYYY)
         """)
-        
+
         if st.session_state.chatbot.data_loader.range_data is not None:
             st.header("📊 Item Ranges")
             st.dataframe(st.session_state.chatbot.data_loader.range_data, use_container_width=True)
-    
+
     col1, col2 = st.columns([2, 1])
-    chart_col, map_col = st.columns([2, 1])  # Define chart and map columns
-    
+    chart_col, map_col = st.columns([2, 1])
+
     with col1:
         st.header("💬 Chat with the Bot")
-        
         user_query = st.text_input(
             "Ask about forecasting:",
             placeholder="e.g., Show forecasting of FOODS_1_001 in CA from 2016-05-23 to 2016-06-19",
             key="user_input"
         )
-        
+
         if st.button("Send", type="primary") and user_query:
+    # Initialize persistent store list if not present
+            if "selected_stores" not in st.session_state:
+                st.session_state.selected_stores = []
+
+            # Find previous parsed query for add/remove context
             prev_query = None
             for sender, content, *rest in reversed(st.session_state.chat_history):
                 if sender == "user":
@@ -634,24 +621,53 @@ def main():
                     if not parsed_prev.get('error'):
                         prev_query = parsed_prev
                         break
+
             parsed_query = st.session_state.chatbot.parse_query(user_query, prev_query)
+
+            # Update selected_stores based on action
+            q_lower = user_query.lower()
+            if "add" in q_lower:
+                for s in parsed_query["stores"]:
+                    if s not in st.session_state.selected_stores:
+                        st.session_state.selected_stores.append(s)
+
+            elif "remove" in q_lower:
+                for s in parsed_query["stores"]:
+                    if s in st.session_state.selected_stores:
+                        st.session_state.selected_stores.remove(s)
+                    else:
+                        st.warning(f"Store {s} was not already in the previous query.")
+
+            else:
+                # New base query replaces the store list
+                st.session_state.selected_stores = parsed_query["stores"]
+
+            # Always use the updated store list in parsed_query
+            parsed_query["stores"] = st.session_state.selected_stores
+
             st.session_state.chat_history.append(("user", user_query))
-            
+
             if parsed_query.get('error'):
                 st.session_state.chat_history.append(("bot", parsed_query['error']))
             else:
+                # Date range only for chart display (calculations ignore range)
                 date_range = None
                 if parsed_query.get('date_range'):
                     try:
                         start, end = parsed_query['date_range'].split(' to ')
                         date_range = st.session_state.chatbot._validate_date_range(start, end)
                         if not date_range:
-                            st.session_state.chat_history.append(("bot", "Invalid date range. Use 'YYYY-MM-DD to YYYY-MM-DD' or 'DD-MM-YYYY to DD-MM-YYYY'."))
+                            st.session_state.chat_history.append(
+                                ("bot", "Invalid date range. Use 'YYYY-MM-DD to YYYY-MM-DD' or 'DD-MM-YYYY to DD-MM-YYYY'.")
+                            )
                             st.rerun()
-                    except:
-                        st.session_state.chat_history.append(("bot", "Invalid date range format. Use 'YYYY-MM-DD to YYYY-MM-DD' or 'DD-MM-YYYY to DD-MM-YYYY'."))
+                    except Exception:
+                        st.session_state.chat_history.append(
+                            ("bot", "Invalid date range format. Use 'YYYY-MM-DD to YYYY-MM-DD' or 'DD-MM-YYYY to DD-MM-YYYY'.")
+                        )
                         st.rerun()
-                
+
+                # Optional range validation for item existence
                 valid_item = False
                 if st.session_state.chatbot.data_loader.range_data is not None:
                     range_check = st.session_state.chatbot.data_loader.range_data[
@@ -661,124 +677,124 @@ def main():
                     if not range_check.empty and int(parsed_query['item']) <= range_check['range'].max():
                         valid_item = True
                     else:
-                        st.session_state.chat_history.append(("bot", f"Item {parsed_query['item']} is not available for {parsed_query['category']} in {', '.join(parsed_query['stores'])}."))
-                
+                        st.session_state.chat_history.append(
+                            ("bot", f"Item {parsed_query['item']} is not available for {parsed_query['category']} "
+                                    f"in {', '.join(parsed_query['stores'])}.")
+                        )
+
                 if valid_item or st.session_state.chatbot.data_loader.range_data is None:
+                    # Build data_dict for chart & VRP
                     data_dict = {}
                     for store in parsed_query['stores']:
                         forecast_data = st.session_state.chatbot.get_forecast_data(
                             parsed_query['category'], parsed_query['item'], store, date_range
                         )
-                        if forecast_data is not None:
-                            data_dict[store] = forecast_data
-                    
+                        if forecast_data is None:
+                            # Create placeholder dataframe with same structure
+                            if st.session_state.chatbot.data_loader.calendar_data is not None:
+                                day_cols = st.session_state.chatbot.data_loader.calendar_data['d'].astype(str).tolist()
+                                zero_data = {col: [0] for col in day_cols}
+                                zero_data['id'] = [f"{parsed_query['category']}_{parsed_query['item']}_{store}_evaluation"]
+                                forecast_data = pd.DataFrame(zero_data)
+                            else:
+                                forecast_data = pd.DataFrame({"id": [f"{parsed_query['category']}_{parsed_query['item']}_{store}_evaluation"]})
+
+                        data_dict[store] = forecast_data
+
+
                     if data_dict:
-                        current_query = f"{parsed_query['category']}_{parsed_query['item']}_{'_'.join(sorted(parsed_query['stores']))}_{parsed_query.get('date_range', 'all')}"
-                        # Check if the last history entry is a chart for the same query
-                        last_entry_is_duplicate = False
-                        if st.session_state.chat_history and st.session_state.chat_history[-1][0] == "chart":
-                            last_query = st.session_state.last_query
-                            if last_query == current_query:
-                                last_entry_is_duplicate = True
-                
+                        current_query = f"{parsed_query['category']}_{parsed_query['item']}_" \
+                                        f"{'_'.join(sorted(parsed_query['stores']))}_" \
+                                        f"{parsed_query.get('date_range', 'all')}"
+
+                        # Chart
                         chart = st.session_state.chatbot.create_forecast_chart(
                             data_dict, parsed_query['category'], parsed_query['item'], parsed_query['stores'], date_range
                         )
-                        insights = st.session_state.chatbot.generate_insights(
-                            data_dict, parsed_query['category'], parsed_query['item'], parsed_query['stores']
-                        )
-                        st.session_state.chat_history.append(("bot", insights))
-                        
+
+                        # Inventory metrics (JSON) — always full rows, ignoring date_range
+                        metrics = st.session_state.chatbot.generate_insights(parsed_query, data_dict)
+
+                        # Append bot JSON to history
+                        st.session_state.chat_history.append(("bot_json", metrics))
+
                         with chart_col:
-                            if chart and not last_entry_is_duplicate:
-                                unique_key = f"chart_{parsed_query['category']}_{parsed_query['item']}_{'_'.join(sorted(parsed_query['stores']))}_{date_range[0].strftime('%Y%m%d') if date_range else 'all'}_{uuid.uuid4()}"
-                                st.session_state.chat_history.append(("chart", chart, unique_key))
+                            if chart:
+                                unique_key = f"chart_{parsed_query['category']}_{parsed_query['item']}_" \
+                                             f"{'_'.join(sorted(parsed_query['stores']))}_" \
+                                             f"{date_range[0].strftime('%Y%m%d') if date_range else 'all'}_" \
+                                             f"{uuid.uuid4()}"
                                 st.plotly_chart(chart, use_container_width=True, key=unique_key)
-                        
+
                         with map_col:
-                            current_query = f"{parsed_query['category']}_{parsed_query['item']}_{'_'.join(sorted(parsed_query['stores']))}_{parsed_query.get('date_range', 'all')}"
-                            if st.session_state.get('last_query') != current_query:
-                                vrp_result = run_vrp_from_forecast(parsed_query, data_dict)
-                                if vrp_result:
-                                    vrp_map, route_order, total_distance, total_time, total_cost = vrp_result
-                                    st.session_state.vrp_map = vrp_map
-                                    st.session_state.route_order = route_order
-                                    st.session_state.total_distance = total_distance
-                                    st.session_state.total_time = total_time
-                                    st.session_state.total_cost = total_cost
-                                    st.session_state.last_query = current_query
+                            # Run VRP and render map (capture lead_times too for consistency)
+                            vrp_result = run_vrp_from_forecast(parsed_query, data_dict)
+                            if vrp_result:
+                                if len(vrp_result) == 6:
+                                    vrp_map, route_order, total_distance, total_time, total_cost, lead_times = vrp_result
                                 else:
-                                    vrp_map = None
+                                    vrp_map, route_order, total_distance, total_time, total_cost = vrp_result
+                                    lead_times = {}
+                                st.session_state.vrp_map = vrp_map
+                                st.session_state.route_order = route_order
+                                st.session_state.total_distance = total_distance
+                                st.session_state.total_time = total_time
+                                st.session_state.total_cost = total_cost
+                                st.session_state.last_query = current_query
                             else:
-                                vrp_map = st.session_state.vrp_map
-                                route_order = st.session_state.route_order
-                                total_distance = st.session_state.total_distance
-                                total_time = st.session_state.total_time
-                                total_cost = st.session_state.total_cost
-                            
-                            if vrp_map:
+                                vrp_map = None
+
+                            if st.session_state.get('vrp_map'):
                                 st.markdown("### 🚛 Route")
                                 try:
-                                    st_folium(vrp_map, width=400, height=400, key=st.session_state.map_key, returned_objects=[])
+                                    st_folium(st.session_state.vrp_map, width=600, height=400,
+                                              key=st.session_state.map_key, returned_objects=[])
                                 except Exception as e:
                                     st.error(f"Error rendering map: {str(e)}")
-                                    vrp_map.save("temp_map.html")
+                                    st.session_state.vrp_map.save("temp_map.html")
                                     with open("temp_map.html", "r") as f:
                                         map_html = f.read()
                                     st.components.v1.html(map_html, width=400, height=400)
-                                
-                                # Display route summary
-                                st.markdown(f"**Total Distance:** {total_distance:.2f} km")
-                                st.markdown(f"**Total Time:** {total_time / 3600:.2f} hours")
-                                st.markdown(f"**Total Cost:** ${total_cost:.2f}")
-                                # Route order can be displayed if needed, but it's already on the map
+
+                                st.markdown(f"**Total Distance:** {st.session_state.total_distance:.2f} km")
+                                st.markdown(f"**Total Time:** {st.session_state.total_time / 3600:.2f} hours")
+                                st.markdown(f"**Total Cost:** ${st.session_state.total_cost:.2f}")
                             else:
                                 st.info("No route available for selected stores.")
-                                            
+
+                            if 'exec_agent' not in st.session_state:
+                                st.session_state.exec_agent = ExecutiveSummaryAgent()
+
+                            exec_summary = st.session_state.exec_agent.generate_report(
+                                    parsed_query, data_dict, metrics, vrp_result, st.session_state.chatbot.data_loader
+                            )
+
+                            st.markdown("## 📊 Executive Summary")
+                            st.write(exec_summary)
+                            
                     else:
                         st.session_state.chat_history.append((
                             "bot",
-                            f"No forecast data found for {parsed_query['category']}_{parsed_query['item']} in {', '.join(parsed_query['stores'])}."
+                            f"No forecast data found for {parsed_query['category']}_{parsed_query['item']} in "
+                            f"{', '.join(parsed_query['stores'])}."
                         ))
-        
-        st.header("💭 Conversation History")
-        # Exclude the most recent entry if it’s a chart for the current query
-        history_to_show = st.session_state.chat_history[-10:]
-        if history_to_show and history_to_show[-1][0] == "chart":
-            current_query = f"{parsed_query['category']}_{parsed_query['item']}_{'_'.join(sorted(parsed_query['stores']))}_{parsed_query.get('date_range', 'all')}" if 'parsed_query' in locals() else None
-            last_query = st.session_state.last_query
-            if current_query and last_query == current_query:
-                history_to_show = history_to_show[:-1]  # Exclude the latest chart if it’s for the current query
-        
-        for i, (sender, content, *key) in enumerate(reversed(history_to_show)):
-            if sender == "user":
-                st.markdown(f"**You:** {content}")
-            elif sender == "bot":
-                st.markdown(f"**Bot:** {content}")
-            elif sender == "chart":
-                history_key = f"history_chart_{i}_{uuid.uuid4()}"
-                st.plotly_chart(content, use_container_width=True, key=history_key)
-            st.markdown("---")
-    
-    with col2:
-        st.header("📊 Quick Stats")
-        if st.session_state.chatbot.data_loader.forecast_data_val is not None:
-            total_products = len(st.session_state.chatbot.data_loader.forecast_data_val)
-            categories = set(st.session_state.chatbot.data_loader.forecast_data_val['id'].str.split('_').str[0])
-            st.metric("Total Products", total_products)
-            st.metric("Categories", len(categories))
-            st.metric("Stores", 10)
-            
-            st.header("📋 Sample Data")
-            sample_data = st.session_state.chatbot.data_loader.forecast_data_val[['id']].head()
-            st.dataframe(sample_data, use_container_width=True)
-    
-    if st.button("🗑️ Clear Chat History"):
-        st.session_state.chat_history = []
-        st.session_state.last_query = None
-        st.session_state.vrp_map = None
-        st.session_state.map_key = None
-        st.rerun()
+
+    # Conversation history (show latest ~10)
+    st.header("💭 Conversation History")
+    history_to_show = st.session_state.chat_history[-10:]
+    for i, (sender, content, *rest) in enumerate(reversed(history_to_show)):
+        if sender == "user":
+            st.markdown(f"**You:** {content}")
+        elif sender == "bot":
+            st.markdown(f"**Bot:** {content}")
+        elif sender == "bot_json":
+            # Pretty JSON rendering
+            st.json(content)
+        elif sender == "chart":
+            history_key = f"history_chart_{i}_{uuid.uuid4()}"
+            st.plotly_chart(content, use_container_width=True, key=history_key)
+        st.markdown("---")
+
 
 if __name__ == "__main__":
     main()
