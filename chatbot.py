@@ -23,7 +23,7 @@ from langchain_community.embeddings import OpenAIEmbeddings
 from langchain_openai import ChatOpenAI
 from langchain_core.runnables import RunnableSequence
 from langchain_core.output_parsers import JsonOutputParser
-
+import joblib
 # Load environment variables
 load_dotenv()
 
@@ -47,6 +47,10 @@ class ForecastingChatbot:
         )
         self.vector_store = None
         self.setup_vector_store()
+        try:
+            self.risk_model = joblib.load("risk_model.pkl")
+        except Exception:
+            self.risk_model = None
 
     def setup_vector_store(self):
         """Initialize FAISS vector store with product, calendar, and range data"""
@@ -457,84 +461,66 @@ class ForecastingChatbot:
 
 
     def generate_insights(self, parsed_query: Dict, forecast_data_dict: Dict[str, pd.DataFrame]) -> List[Dict]:
-        """
-        Generate inventory metrics per store using full rows (no date-range filtering):
-        EOQ = sqrt((2 * Demand * OrderingCost) / HoldingCost)
-        Safety Stock = Z * σ * sqrt(LeadTime)
-        Reorder Point = (AvgDemand * LeadTime) + Safety Stock
-
-        Demand & AvgDemand -> ALL evaluation columns
-        σ (std dev) -> ALL validation columns
-        LeadTime -> from VRP (hours) converted to days
-        """
         category = parsed_query['category']
         item = parsed_query['item']
         stores = parsed_query['stores']
 
-        # --- Business constants (adjust to your real values) ---
-        ORDERING_COST = 50.0     # Cost per order
-        HOLDING_COST = 2.0       # Cost per unit per year
-        Z = 1.65                 # ~95% service level
+        ORDERING_COST = 50.0
+        HOLDING_COST = 2.0
+        Z = 1.65
 
-        # Pre-fetch VRP lead times (in hours) across selected stores
         try:
-            # run_vrp_from_forecast returns: m, route_order, total_distance, total_time, total_cost, lead_times
             vrp_result = run_vrp_from_forecast(parsed_query, forecast_data_dict)
             if vrp_result and len(vrp_result) >= 6:
-                lead_times = vrp_result[5]  # dict: {store_code: hours}
+                lead_times = vrp_result[5]
             else:
                 lead_times = {s: 0.0 for s in stores}
         except Exception:
             lead_times = {s: 0.0 for s in stores}
 
         results = []
-
         for store in stores:
             sku_eval = f"{category}_{item}_{store}_evaluation"
             sku_val = f"{category}_{item}_{store}_validation"
 
-            # --- Forecast demand (use ALL evaluation days) ---
             eval_df = self.data_loader.forecast_data_eval
             eval_row = eval_df[eval_df["id"] == sku_eval] if eval_df is not None else pd.DataFrame()
             eval_vals = []
             if not eval_row.empty:
-                eval_vals = pd.to_numeric(
-                    eval_row.drop(columns=["id"], errors="ignore").values.flatten(),
-                    errors="coerce"
-                )
+                eval_vals = pd.to_numeric(eval_row.drop(columns=["id"], errors="ignore").values.flatten(), errors="coerce")
                 eval_vals = eval_vals[~np.isnan(eval_vals)]
             demand_forecast = float(np.sum(eval_vals)) if len(eval_vals) else 0.0
             avg_demand_forecast = float(np.mean(eval_vals)) if len(eval_vals) else 0.0
 
-            # --- Historical σ (use ALL validation days) ---
             val_df = self.data_loader.forecast_data_val
             val_row = val_df[val_df["id"] == sku_val] if val_df is not None else pd.DataFrame()
             val_vals = []
             if not val_row.empty:
-                val_vals = pd.to_numeric(
-                    val_row.drop(columns=["id"], errors="ignore").values.flatten(),
-                    errors="coerce"
-                )
+                val_vals = pd.to_numeric(val_row.drop(columns=["id"], errors="ignore").values.flatten(), errors="coerce")
                 val_vals = val_vals[~np.isnan(val_vals)]
             sigma = float(np.std(val_vals, ddof=1)) if len(val_vals) > 1 else 0.0
 
-            # --- Lead time from VRP (convert hours -> days) ---
             lead_time_hours = float(lead_times.get(store, 0.0))
             lead_time_days = lead_time_hours / 24.0 if lead_time_hours > 0 else 0.0
 
-            # --- Calculations ---
-            # EOQ uses total forecast demand (future-focused)
             eoq = math.sqrt((2.0 * max(demand_forecast, 0.0) * ORDERING_COST) / max(HOLDING_COST, 1e-9)) if demand_forecast > 0 else 0.0
-            # Safety Stock uses historical variability and sqrt(LeadTime)
             safety_stock = Z * sigma * math.sqrt(lead_time_days) if lead_time_days > 0 else 0.0
-            # ROP uses avg forecast demand over lead time plus safety stock
             reorder_point = (avg_demand_forecast * lead_time_days) + safety_stock
+
+            risk_label = "Unknown"
+            if self.risk_model:
+                features = [[sigma, lead_time_days, avg_demand_forecast, demand_forecast]]
+                try:
+                    risk_label = self.risk_model.predict(features)[0]
+                except Exception:
+                    pass
 
             results.append({
                 "SKU_ID": f"{category}_{item}_{store}",
                 "EOQ": round(eoq, 2),
                 "ReorderPoint": round(reorder_point, 2),
-                "SafetyStock": round(safety_stock, 2)
+                "SafetyStock": round(safety_stock, 2),
+                "RiskPrediction": risk_label
             })
 
         return results
@@ -730,17 +716,22 @@ def main():
                             # Run VRP and render map (capture lead_times too for consistency)
                             vrp_result = run_vrp_from_forecast(parsed_query, data_dict)
                             if vrp_result:
+                                # After unpacking vrp_result
                                 if len(vrp_result) == 6:
                                     vrp_map, route_order, total_distance, total_time, total_cost, lead_times = vrp_result
                                 else:
                                     vrp_map, route_order, total_distance, total_time, total_cost = vrp_result
                                     lead_times = {}
+
+                                # Store VRP results in session
                                 st.session_state.vrp_map = vrp_map
                                 st.session_state.route_order = route_order
                                 st.session_state.total_distance = total_distance
                                 st.session_state.total_time = total_time
                                 st.session_state.total_cost = total_cost
                                 st.session_state.last_query = current_query
+                                st.session_state.lead_times = lead_times  # ✅ keep lead_times
+
                             else:
                                 vrp_map = None
 
@@ -766,8 +757,14 @@ def main():
                                 st.session_state.exec_agent = ExecutiveSummaryAgent()
 
                             exec_summary = st.session_state.exec_agent.generate_report(
-                                    parsed_query, data_dict, metrics, vrp_result, st.session_state.chatbot.data_loader
+                                parsed_query,
+                                data_dict,
+                                metrics,
+                                vrp_result,
+                                st.session_state.chatbot.data_loader,
+                                lead_times=st.session_state.get("lead_times", {})  # ✅ forward lead_times
                             )
+
 
                             st.markdown("## 📊 Executive Summary")
                             st.write(exec_summary)

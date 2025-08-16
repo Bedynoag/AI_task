@@ -1,17 +1,18 @@
-# executive_summary_agent.py
 import os
 import json
+import pandas as pd
+import numpy as np
 from dataclasses import dataclass
 from typing import Dict, List, Any, Optional, Tuple
 from datetime import datetime
-import pandas as pd
-import numpy as np
-
 from dotenv import load_dotenv
+from sklearn.ensemble import IsolationForest
+from sklearn.ensemble import RandomForestClassifier
 
-# LLM backends (OpenAI default; simple switcher for Mixtral/Qwen via env/config)
 from langchain_openai import ChatOpenAI
 from langchain.prompts import PromptTemplate
+
+load_dotenv()
 
 SUPPORTED_MODELS = {
     "openai:gpt-4o-mini": ("openai", "gpt-4o-mini"),
@@ -26,6 +27,29 @@ SPLIT_DATE = pd.to_datetime("2016-05-23")
 
 load_dotenv()
 
+class RecommendationManager:
+    def __init__(self, path="user_feedback.csv"):
+        self.path = path
+        if os.path.exists(path):
+            self.history = pd.read_csv(path)
+        else:
+            self.history = pd.DataFrame(columns=["user", "rec", "accepted"])
+
+
+    def update_feedback(self, user_id, rec_text, accepted: bool):
+        new_row = {"user": user_id, "rec": rec_text, "accepted": accepted}
+        self.history = pd.concat([self.history, pd.DataFrame([new_row])], ignore_index=True)
+        self.history.to_csv(self.path, index=False)
+
+    def personalize(self, recs: list, user_id: str):
+        if self.history.empty:
+            return recs
+        user_prefs = self.history[self.history["user"] == user_id]
+        if user_prefs.empty:
+            return recs
+        liked = user_prefs[user_prefs["accepted"] == True]["rec"].tolist()
+        return sorted(recs, key=lambda r: sum(1 for l in liked if l in r), reverse=True)
+    
 @dataclass
 class PriceChange:
     store: str
@@ -68,13 +92,59 @@ class ExecutiveSummaryAgent:
             except Exception:
                 pass
 
+    def _dynamic_risk_predictions(self, stores, eval_df, val_df, lead_times):
+        features, labels, store_list = [], [], []
+
+        for store in stores:
+            row = eval_df[eval_df["id"].str.contains(store)]
+            if row.empty:
+                continue
+            row = row.iloc[0]
+            sku_id = row["id"]
+            val_row = val_df[val_df["id"] == sku_id.replace("evaluation", "validation")]
+            if val_row.empty:
+                continue
+
+            eval_vals = pd.to_numeric(row.drop("id").values, errors="coerce")
+            val_vals = pd.to_numeric(val_row.drop("id", axis=1).values.flatten(), errors="coerce")
+
+            demand_forecast = np.nansum(eval_vals)
+            avg_demand_forecast = np.nanmean(eval_vals)
+            sigma = np.nanstd(val_vals, ddof=1)
+
+            # ✅ use real lead time if available
+            lead_time_days = float(lead_times.get(store, 1.0))
+
+            X = [sigma, lead_time_days, avg_demand_forecast, demand_forecast]
+            features.append(X)
+            store_list.append(store)
+
+            # quick label rule (just for supervised fit, can refine)
+            if demand_forecast == 0 or avg_demand_forecast < sigma:
+                labels.append("Stockout Risk")
+            elif demand_forecast > avg_demand_forecast * 30:
+                labels.append("Oversupply Risk")
+            else:
+                labels.append("Low Risk")
+
+        if not features:
+            return {}
+
+        model = RandomForestClassifier(n_estimators=50, random_state=42)
+        model.fit(features, labels)
+        preds = model.predict(features)
+
+        return {s: p for s, p in zip(store_list, preds)}
+ 
+    
     def generate_report(
         self,
         parsed_query: Dict,
         forecast_data_dict: Dict[str, pd.DataFrame],
         metrics: List[Dict[str, Any]],
         vrp_result: Optional[Tuple],
-        data_loader
+        data_loader,
+        lead_times: Dict[str, float] = None  # Add lead_times parameter with default None
     ) -> str:
         category = parsed_query.get("category")
         item = parsed_query.get("item")
@@ -82,23 +152,26 @@ class ExecutiveSummaryAgent:
         date_range = parsed_query.get("date_range")
         start_dt, end_dt = self._parse_date_range(date_range)
 
+        # Ensure lead_times is a dictionary
+        lead_times = lead_times or {}
+
         # Historical patterns (< SPLIT_DATE)
         hist_price_changes = self._detect_price_changes(category, item, stores, end_dt=SPLIT_DATE - pd.Timedelta(days=1))
         hist_events = self._collect_events_and_snap(data_loader, end_dt=SPLIT_DATE - pd.Timedelta(days=1))
-        hist_risks = self._detect_risks(parsed_query, forecast_data_dict, metrics, {}, end_dt=SPLIT_DATE - pd.Timedelta(days=1), use_forecast=False)
+        hist_risks = self._detect_risks(parsed_query, forecast_data_dict, metrics, lead_times, end_dt=SPLIT_DATE - pd.Timedelta(days=1), use_forecast=False)
 
         # Future projections (≥ SPLIT_DATE)
-        lead_times = {}
         route_sequence = []
         total_distance = total_time_hours = total_cost = None
         if vrp_result:
             if len(vrp_result) >= 6:
-                _, route_order, total_distance, total_time, total_cost, lead_times = vrp_result
+                _, route_order, total_distance, total_time, total_cost, vrp_lead_times = vrp_result
                 total_time_hours = total_time / 3600 if total_time else None
+                # Merge vrp_lead_times into lead_times, prioritizing vrp_lead_times
+                lead_times.update(vrp_lead_times)
             else:
                 _, route_order, total_distance, total_time, total_cost = vrp_result
                 total_time_hours = total_time / 3600 if total_time else None
-                lead_times = {}
             if route_order is not None:
                 for idx in route_order:
                     if idx == 0:
@@ -111,7 +184,24 @@ class ExecutiveSummaryAgent:
         future_price_changes = self._detect_price_changes(category, item, stores, start_dt=SPLIT_DATE)
         future_events = self._collect_events_and_snap(data_loader, start_dt=SPLIT_DATE)
         future_risks = self._detect_risks(parsed_query, forecast_data_dict, metrics, lead_times, start_dt=SPLIT_DATE, use_forecast=True)
+        
+        val_df = data_loader.forecast_data_val
+        eval_df = data_loader.forecast_data_eval
+        ml_risks = self._dynamic_risk_predictions(stores, eval_df, val_df, lead_times)
 
+        # Merge ML risks into future_risks
+        for store, risk_type in ml_risks.items():
+            if risk_type == "Stockout Risk":
+                future_risks["stockout"].append(f"{store}: ML model predicts stockout risk.")
+            elif risk_type == "Oversupply Risk":
+                future_risks["oversupply"].append(f"{store}: ML model predicts oversupply risk.")
+            else:
+                future_risks.setdefault("stable", []).append(f"{store}: Stable demand predicted.")
+
+            for row in metrics:
+                sku_id = row.get("SKU_ID", "")
+                if sku_id.endswith(store):
+                    row["RiskPrediction"] = risk_type
         # Build context
         llm_context = {
             "overview": {
@@ -136,7 +226,17 @@ class ExecutiveSummaryAgent:
         # LLM prompt
         prompt = self._summary_prompt().format(**llm_context)
         response = self.llm.invoke(prompt)
-        return response.content
+        response_text = response.content
+
+        # Personalization step
+        user_id = "default_user"  # Or pass dynamically
+        lines = response_text.splitlines()
+        bullet_recs = [l for l in lines if l.strip().startswith("-")]
+        personalized = RecommendationManager().personalize(bullet_recs, user_id)
+        if personalized:
+            response_text = "\n".join(personalized)
+
+        return response_text
 
     def _detect_price_changes(
         self,
@@ -224,7 +324,19 @@ class ExecutiveSummaryAgent:
         end_dt: Optional[datetime] = None,
         use_forecast: bool = True
     ) -> Dict[str, Any]:
-        risk = {"stockout": [], "oversupply": [], "logistics": [], "notable_dates": []}
+        risk = {"stockout": [], "oversupply": [], "logistics": [], "notable_dates": [], "anomaly": []}
+        
+        for store, df in (forecast_data_dict or {}).items():
+            if use_forecast:
+                day_cols = [c for c in df.columns if c.isdigit()]
+                if day_cols:
+                    values = pd.to_numeric(df[day_cols].iloc[0], errors="coerce").fillna(0.0).values
+                    if len(values) >= 5:
+                        model = IsolationForest(contamination=0.05, random_state=42)
+                        preds = model.fit_predict(values.reshape(-1, 1))
+                        if np.sum(preds == -1) > 0:
+                            risk["anomaly"].append(f"{store}: unusual demand spikes detected")
+       
         metrics_by_store = {}
         for row in metrics or []:
             sku_id = row.get("SKU_ID", "")
@@ -298,14 +410,14 @@ Blend past trends with future forecasts to create a concise, actionable **execut
 Overview: {overview}
 
 Historical patterns:
-- Price changes: {historical[price_changes]}
-- Events: {historical[events]}
-- Risks: {historical[risks]}
+- Price changes: {historical}
+- Events: {historical}
+- Risks: {historical}
 
 Future outlook:
-- Price changes: {future[price_changes]}
-- Events: {future[events]}
-- Risks: {future[risks]}
+- Price changes: {future}
+- Events: {future}
+- Risks: {future}
 
 Logistics: {logistics_notes}
 
