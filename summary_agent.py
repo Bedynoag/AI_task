@@ -23,7 +23,10 @@ SUPPORTED_MODELS = {
 }
 
 # Date split constant
+
 SPLIT_DATE = pd.to_datetime("2016-05-23")
+FORECAST_END = pd.to_datetime("2016-07-19")  # push agent to reason into July
+
 
 load_dotenv()
 
@@ -144,7 +147,7 @@ class ExecutiveSummaryAgent:
         metrics: List[Dict[str, Any]],
         vrp_result: Optional[Tuple],
         data_loader,
-        lead_times: Dict[str, float] = None  # Add lead_times parameter with default None
+        lead_times: Dict[str, float] = None
     ) -> str:
         category = parsed_query.get("category")
         item = parsed_query.get("item")
@@ -152,22 +155,20 @@ class ExecutiveSummaryAgent:
         date_range = parsed_query.get("date_range")
         start_dt, end_dt = self._parse_date_range(date_range)
 
-        # Ensure lead_times is a dictionary
         lead_times = lead_times or {}
 
-        # Historical patterns (< SPLIT_DATE)
+        # Historical (< SPLIT_DATE)
         hist_price_changes = self._detect_price_changes(category, item, stores, end_dt=SPLIT_DATE - pd.Timedelta(days=1))
         hist_events = self._collect_events_and_snap(data_loader, end_dt=SPLIT_DATE - pd.Timedelta(days=1))
         hist_risks = self._detect_risks(parsed_query, forecast_data_dict, metrics, lead_times, end_dt=SPLIT_DATE - pd.Timedelta(days=1), use_forecast=False)
 
-        # Future projections (≥ SPLIT_DATE)
+        # Future (≥ SPLIT_DATE)
         route_sequence = []
         total_distance = total_time_hours = total_cost = None
         if vrp_result:
             if len(vrp_result) >= 6:
                 _, route_order, total_distance, total_time, total_cost, vrp_lead_times = vrp_result
                 total_time_hours = total_time / 3600 if total_time else None
-                # Merge vrp_lead_times into lead_times, prioritizing vrp_lead_times
                 lead_times.update(vrp_lead_times)
             else:
                 _, route_order, total_distance, total_time, total_cost = vrp_result
@@ -184,12 +185,12 @@ class ExecutiveSummaryAgent:
         future_price_changes = self._detect_price_changes(category, item, stores, start_dt=SPLIT_DATE)
         future_events = self._collect_events_and_snap(data_loader, start_dt=SPLIT_DATE)
         future_risks = self._detect_risks(parsed_query, forecast_data_dict, metrics, lead_times, start_dt=SPLIT_DATE, use_forecast=True)
-        
+
+        # ML risk predictions
         val_df = data_loader.forecast_data_val
         eval_df = data_loader.forecast_data_eval
         ml_risks = self._dynamic_risk_predictions(stores, eval_df, val_df, lead_times)
 
-        # Merge ML risks into future_risks
         for store, risk_type in ml_risks.items():
             if risk_type == "Stockout Risk":
                 future_risks["stockout"].append(f"{store}: ML model predicts stockout risk.")
@@ -198,17 +199,21 @@ class ExecutiveSummaryAgent:
             else:
                 future_risks.setdefault("stable", []).append(f"{store}: Stable demand predicted.")
 
-            for row in metrics:
-                sku_id = row.get("SKU_ID", "")
-                if sku_id.endswith(store):
-                    row["RiskPrediction"] = risk_type
-        # Build context
+            # Store ML predictions separately, don't mutate metrics
+            ml_predictions = {}
+            for store, risk_type in ml_risks.items():
+                ml_predictions[store] = risk_type
+
+
+        # Build context matching the prompt
         llm_context = {
             "overview": {
                 "category": category,
                 "item": item,
                 "stores": ", ".join(sorted(stores)) if stores else "—",
-                "date_range": f"{start_dt.date().isoformat()} to {end_dt.date().isoformat()}" if start_dt and end_dt else "unspecified"
+                "date_range": f"{start_dt.date().isoformat()} to {end_dt.date().isoformat()}"
+                            if start_dt and end_dt else "unspecified",
+                "forecast_horizon": f"2016-05-23 to {FORECAST_END.date().isoformat()}"
             },
             "historical": {
                 "price_changes": self._humanize_price_changes(hist_price_changes),
@@ -220,7 +225,8 @@ class ExecutiveSummaryAgent:
                 "events": future_events,
                 "risks": future_risks
             },
-            "logistics_notes": self._logistics_notes(route_sequence, total_distance, total_time_hours, total_cost)
+            "logistics_notes": self._logistics_notes(route_sequence, total_distance, total_time_hours, total_cost),
+            "ml_risks": ml_predictions 
         }
 
         # LLM prompt
@@ -228,8 +234,8 @@ class ExecutiveSummaryAgent:
         response = self.llm.invoke(prompt)
         response_text = response.content
 
-        # Personalization step
-        user_id = "default_user"  # Or pass dynamically
+        # Personalization
+        user_id = "default_user"
         lines = response_text.splitlines()
         bullet_recs = [l for l in lines if l.strip().startswith("-")]
         personalized = RecommendationManager().personalize(bullet_recs, user_id)
@@ -402,32 +408,43 @@ class ExecutiveSummaryAgent:
     def _summary_prompt(self) -> PromptTemplate:
         return PromptTemplate(
             input_variables=["overview", "historical", "future", "logistics_notes"],
-            template="""
-You are an Executive Supply Chain Analyst. 
-Use both historical (< 2016-05-23) and forecasted (≥ 2016-05-23) data. 
-Blend past trends with future forecasts to create a concise, actionable **executive summary**.
+            template=f"""
+    You are an Executive Supply Chain Analyst. 
+    Use both historical data (< {SPLIT_DATE.date()}) and forecasted data (≥ {SPLIT_DATE.date()} up to 2016-06-19).
+    Then **extend reasoning forward** until {FORECAST_END.date()} using:
+    - Seasonal patterns from the calendar (events, SNAP, holidays).
+    - Historical spikes and anomalies.
+    - EOQ, ROP, and Safety Stock metrics.
+    - Logistics lead times & risks.
 
-Overview: {overview}
+    Overview: {{overview}}
 
-Historical patterns:
-- Price changes: {historical}
-- Events: {historical}
-- Risks: {historical}
+    Historical patterns:
+    - Price changes: {{historical[price_changes]}}
+    - Events: {{historical[events]}}
+    - Risks: {{historical[risks]}}
 
-Future outlook:
-- Price changes: {future}
-- Events: {future}
-- Risks: {future}
+    Future outlook (2016-05-23 → 2016-07-19):
+    - Price changes: {{future[price_changes]}}
+    - Events: {{future[events]}}
+    - Risks: {{future[risks]}}
 
-Logistics: {logistics_notes}
+    Logistics: {{logistics_notes}}
 
-Guidelines:
-- Focus on **what will happen, when, and what to do**.
-- Highlight if historical patterns suggest a repeat in the future.
-- Make 3–6 short bullet recommendations.
-- Avoid repeating raw numbers already shown elsewhere.
-"""
+    Guidelines:
+    - Forecast **beyond June 19 → July 19** by extrapolating from historical demand spikes, SNAP disbursements, seasonal events (e.g., Father’s Day, Independence Day).
+    - Focus on **what will happen, when, and what to do**.
+    - Make **4-6 short, actionable recommendations**.
+    - Translate risks into forward-looking actions:
+    - Stockout → advise early replenishment / increase buffer
+    - Oversupply → adjust EOQ, redistribute, run promotions
+    - Anomalies → safety buffers, closer monitoring
+    - Long lead times → split shipments, pre-stage stock
+    - Always mention **timing** (e.g., "by late June", "early July").
+    """
         )
+
+
 
     def _safe_read_csv(self, path: str) -> Optional[pd.DataFrame]:
         try:

@@ -520,7 +520,7 @@ class ForecastingChatbot:
                 "EOQ": round(eoq, 2),
                 "ReorderPoint": round(reorder_point, 2),
                 "SafetyStock": round(safety_stock, 2),
-                "RiskPrediction": risk_label
+                # "RiskPrediction": risk_label
             })
 
         return results
